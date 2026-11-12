@@ -1,0 +1,343 @@
+// SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+// Modified by Steve Pederzani in 2026 for AMD GPUs (HIP). See NOTICE.md.
+
+#pragma once
+
+namespace wp {
+
+enum HashGridTypeId {
+    HASH_GRID_TYPE_FLOAT16 = 0,
+    HASH_GRID_TYPE_FLOAT32 = 1,
+    HASH_GRID_TYPE_FLOAT64 = 2,
+};
+
+// Note: Field order is important! Type-independent fields come first so that
+// point_ids is at a consistent offset regardless of Type. This allows
+// hash_grid_point_id to work without knowing the grid's scalar type.
+template <typename Type> struct HashGrid_t {
+    int* point_cells = nullptr;  // cell id of a point
+    int* point_ids = nullptr;  // index to original point
+    uint64_t* point_keys = nullptr;  // sorted (cell, group) keys, allocated only for grouped builds
+
+    int* cell_starts = nullptr;  // start index of a range of indices belonging to a cell, dim_x*dim_y*dim_z in length
+    int* cell_ends = nullptr;  // end index of a range of indices belonging to a cell, dim_x*dim_y*dim_z in length
+
+    int dim_x = 0;
+    int dim_y = 0;
+    int dim_z = 0;
+
+    int num_points = 0;
+    int max_points = 0;
+    int max_keys = 0;  // capacity of point_keys
+    int has_groups = 0;  // whether the most recent build was grouped
+
+    void* context = nullptr;
+
+    // Type-dependent fields at end (different sizes for half/float/double)
+    Type cell_width = {};
+    Type cell_width_inv = {};
+};
+
+// Type aliases for backward compatibility and convenience
+using HashGrid = HashGrid_t<float>;
+using HashGridH = HashGrid_t<half>;
+using HashGridD = HashGrid_t<double>;
+
+template <typename Type> CUDA_CALLABLE inline int hash_grid_num_cells(const HashGrid_t<Type>& grid)
+{
+    // dimensions are validated against overflow at grid creation (HashGrid._validate_cell_count)
+    return grid.dim_x * grid.dim_y * grid.dim_z;
+}
+
+template <typename Type> CUDA_CALLABLE inline bool hash_grid_has_groups(const HashGrid_t<Type>& grid)
+{
+    return grid.point_keys != nullptr && grid.has_groups != 0;
+}
+
+// composite sort key: spatial cell in the high bits, group id bit pattern in the low bits
+CUDA_CALLABLE inline uint64_t hash_grid_point_key(int cell, int group)
+{
+    return ((uint64_t)cell << 32) | (uint64_t)(uint32_t)group;
+}
+
+// first index in [lo, hi) whose key is >= key
+CUDA_CALLABLE inline int hash_grid_lower_bound(const uint64_t* keys, int lo, int hi, uint64_t key)
+{
+    while (lo < hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if (keys[mid] < key)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+// Convert a scaled coordinate to a virtual cell coordinate. Use floor() to round toward negative
+// infinity, not int() which truncates toward zero (int(-0.3)=0 instead of floor(-0.3)=-1).
+// Values beyond [INT_MIN, INT_MAX - 1], including infinities, clamp to it and NaN maps to 0, so
+// the conversion is always defined. Excluding INT_MAX lets traversal step one cell past any end
+// coordinate without overflowing; merging the top two cells only adds candidates.
+//
+// HIP doesn't use __float2int_rd or __double2int_rd here. CUDA's versions saturate and map NaN to 0 in one instruction
+// (cvt.rmi), but HIP's are a C cast of floor(v), which is undefined for NaN, infinities, and values outside the int range, and
+// the optimizer relies on that. A query from a NaN or infinite coordinate never ended (test_hashgrid_nan_coordinates hung in its
+// kernel), and a float16 coordinate that overflowed to infinity was returned from several cells
+// (test_hashgrid_extreme_coordinates). On HIP the conversion takes the explicit, defined path below, at the cost of a few
+// compares per query.
+CUDA_CALLABLE inline int hash_grid_cell_coord(float v)
+{
+#if defined(__CUDA_ARCH__)
+    // rounds down, saturates out-of-range values, and maps NaN to 0 in one instruction
+    return min(__float2int_rd(v), INT_MAX - 1);
+#else
+    const float c = floor(v);
+    // float(INT_MAX) rounds up to 2^31, so compare against the exact bounds -2^31 and 2^31
+    if (c >= 2147483648.0f)
+        return INT_MAX - 1;
+    if (c >= -2147483648.0f)
+        return int(c);
+    if (c < -2147483648.0f)
+        return INT_MIN;
+    return 0;
+#endif
+}
+
+CUDA_CALLABLE inline int hash_grid_cell_coord(double v)
+{
+#if defined(__CUDA_ARCH__)
+    // Unlike the float conversion, the double conversion maps NaN to INT_MIN. Detect NaN from its
+    // bits: isnan() compiles to FP64 compares, which are slow on GPUs with little FP64 throughput.
+    // With the sign bit shifted out, NaNs are exactly the patterns above infinity's.
+    const unsigned long long bits = static_cast<unsigned long long>(__double_as_longlong(v)) << 1;
+    return bits > 0xffe0000000000000ULL ? 0 : min(__double2int_rd(v), INT_MAX - 1);
+#else
+    const double c = floor(v);
+    if (c >= 2147483646.0)
+        return INT_MAX - 1;
+    if (c >= -2147483648.0)
+        return int(c);
+    if (c < -2147483648.0)
+        return INT_MIN;
+    return 0;
+#endif
+}
+
+CUDA_CALLABLE inline int hash_grid_cell_coord(half v) { return hash_grid_cell_coord(float(v)); }
+
+// convert a virtual (world) cell coordinate to a physical one
+template <typename Type> CUDA_CALLABLE inline int hash_grid_index(const HashGrid_t<Type>& grid, int x, int y, int z)
+{
+    // Wrap negative coordinates with nonnegative modulo. Clamping cells beyond
+    // a fixed origin causes queries to visit the same physical bucket repeatedly.
+    int cx = x % grid.dim_x;
+    int cy = y % grid.dim_y;
+    int cz = z % grid.dim_z;
+    if (cx < 0)
+        cx += grid.dim_x;
+    if (cy < 0)
+        cy += grid.dim_y;
+    if (cz < 0)
+        cz += grid.dim_z;
+
+    return cz * (grid.dim_x * grid.dim_y) + cy * grid.dim_x + cx;
+}
+
+template <typename Type> CUDA_CALLABLE inline int hash_grid_index(const HashGrid_t<Type>& grid, const vec_t<3, Type>& p)
+{
+    return hash_grid_index(
+        grid, hash_grid_cell_coord(p[0] * grid.cell_width_inv), hash_grid_cell_coord(p[1] * grid.cell_width_inv),
+        hash_grid_cell_coord(p[2] * grid.cell_width_inv)
+    );
+}
+
+// stores state required to traverse neighboring cells of a point
+template <typename Type> struct hash_grid_query_t {
+    CUDA_CALLABLE hash_grid_query_t()
+        : x_start(0)
+        , y_start(0)
+        , z_start(0)
+        , x_end(0)
+        , y_end(0)
+        , z_end(0)
+        , x(0)
+        , y(0)
+        , z(0)
+        , cell(0)
+        , cell_index(0)
+        , cell_end(0)
+        , current(0)
+        , group(0)
+        , filter_by_group(false)
+        , grid()
+    {
+    }
+
+    // Required for adjoint computations.
+    CUDA_CALLABLE inline hash_grid_query_t& operator+=(const hash_grid_query_t& other) { return *this; }
+
+    int x_start;
+    int y_start;
+    int z_start;
+
+    int x_end;
+    int y_end;
+    int z_end;
+
+    int x;
+    int y;
+    int z;
+
+    int cell;
+    int cell_index;  // offset in the current cell (index into cell_indices)
+    int cell_end;  // index following the end of this cell
+
+    int current;  // index of the current iterator value
+
+    int group;  // group id to filter by when filter_by_group is set
+    bool filter_by_group;
+
+    HashGrid_t<Type> grid;
+};
+
+// Type aliases for query structs
+using hash_grid_query_f = hash_grid_query_t<float>;
+using hash_grid_query_h = hash_grid_query_t<half>;
+using hash_grid_query_d = hash_grid_query_t<double>;
+
+
+template <typename Type> CUDA_CALLABLE inline void hash_grid_query_set_cell(hash_grid_query_t<Type>& query)
+{
+    const int cell = hash_grid_index(query.grid, query.x, query.y, query.z);
+    int start = query.grid.cell_starts[cell];
+    int end = query.grid.cell_ends[cell];
+
+    if (query.filter_by_group && hash_grid_has_groups(query.grid)) {
+        // the group's points form a contiguous key-sorted sub-range of the cell;
+        // key + 1 stays bounded by `end` even when the group bits are 0xffffffff
+        const uint64_t key = hash_grid_point_key(cell, query.group);
+        start = hash_grid_lower_bound(query.grid.point_keys, start, end, key);
+        end = hash_grid_lower_bound(query.grid.point_keys, start, end, key + 1);
+    }
+
+    query.cell_index = start;
+    query.cell_end = end;
+}
+
+// Do not want to visit any cells more than once, so limit a large radius to one pass over each
+// dimension. Compare in 64 bits: start + dim - 1 overflows when start is within dim of INT_MAX.
+CUDA_CALLABLE inline int hash_grid_query_end(int start, int end, int dim)
+{
+    return int64(end) - int64(start) >= int64(dim) ? start + (dim - 1) : end;
+}
+
+template <typename Type>
+CUDA_CALLABLE inline hash_grid_query_t<Type>
+hash_grid_query_impl(uint64_t id, vec_t<3, Type> pos, Type radius, int group, bool filter_by_group)
+{
+    hash_grid_query_t<Type> query;
+
+    query.grid = *(const HashGrid_t<Type>*)(id);
+    query.group = group;
+    query.filter_by_group = filter_by_group;
+
+    // Convert coordinate to grid cell indices (see hash_grid_cell_coord above)
+    Type cell_width_inv = query.grid.cell_width_inv;
+
+    query.x_start = hash_grid_cell_coord((pos[0] - radius) * cell_width_inv);
+    query.y_start = hash_grid_cell_coord((pos[1] - radius) * cell_width_inv);
+    query.z_start = hash_grid_cell_coord((pos[2] - radius) * cell_width_inv);
+
+    query.x_end = hash_grid_query_end(
+        query.x_start, hash_grid_cell_coord((pos[0] + radius) * cell_width_inv), query.grid.dim_x
+    );
+    query.y_end = hash_grid_query_end(
+        query.y_start, hash_grid_cell_coord((pos[1] + radius) * cell_width_inv), query.grid.dim_y
+    );
+    query.z_end = hash_grid_query_end(
+        query.z_start, hash_grid_cell_coord((pos[2] + radius) * cell_width_inv), query.grid.dim_z
+    );
+
+    query.x = query.x_start;
+    query.y = query.y_start;
+    query.z = query.z_start;
+
+    hash_grid_query_set_cell(query);
+
+    return query;
+}
+
+template <typename Type>
+CUDA_CALLABLE inline hash_grid_query_t<Type> hash_grid_query(uint64_t id, vec_t<3, Type> pos, Type radius, int group)
+{
+    return hash_grid_query_impl(id, pos, radius, group, true);
+}
+
+template <typename Type>
+CUDA_CALLABLE inline hash_grid_query_t<Type> hash_grid_query(uint64_t id, vec_t<3, Type> pos, Type radius)
+{
+    return hash_grid_query_impl(id, pos, radius, 0, false);
+}
+
+
+template <typename Type> CUDA_CALLABLE inline bool hash_grid_query_next(hash_grid_query_t<Type>& query, int& index)
+{
+    const HashGrid_t<Type>& grid = query.grid;
+    if (!grid.point_cells)
+        return false;
+
+    while (1) {
+        if (query.cell_index < query.cell_end) {
+            // write output index
+            index = grid.point_ids[query.cell_index++];
+            return true;
+        } else {
+            query.x++;
+            if (query.x > query.x_end) {
+                query.x = query.x_start;
+                query.y++;
+            }
+
+            if (query.y > query.y_end) {
+                query.y = query.y_start;
+                query.z++;
+            }
+
+            if (query.z > query.z_end) {
+                // finished lookup grid
+                return false;
+            }
+
+            // update cell pointers
+            hash_grid_query_set_cell(query);
+        }
+    }
+}
+
+template <typename Type> CUDA_CALLABLE inline int iter_next(hash_grid_query_t<Type>& query) { return query.current; }
+
+template <typename Type> CUDA_CALLABLE inline bool iter_cmp(hash_grid_query_t<Type>& query)
+{
+    bool finished = hash_grid_query_next(query, query.current);
+    return finished;
+}
+
+template <typename Type> CUDA_CALLABLE inline hash_grid_query_t<Type> iter_reverse(const hash_grid_query_t<Type>& query)
+{
+    // can't reverse grid queries, users should not rely on neighbor ordering
+    return query;
+}
+
+// hash_grid_point_id is not templated because it only accesses point_ids (int*)
+// which is at the same offset in all HashGrid_t<Type> instantiations
+CUDA_CALLABLE inline int hash_grid_point_id(uint64_t id, int& index)
+{
+    const HashGrid* grid = (const HashGrid*)(id);
+    if (grid->point_ids == nullptr)
+        return -1;
+    return grid->point_ids[index];
+}
+
+
+}  // namespace wp

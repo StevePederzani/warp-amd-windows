@@ -1,0 +1,515 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Steve Pederzani in 2026 for AMD GPUs (HIP). See NOTICE.md.
+
+"""Global configuration settings for Warp.
+
+This module provides settings to control compilation behavior, debugging, performance,
+and runtime behavior of Warp kernels and modules. Settings exist at the global, module,
+and kernel levels, with more specific scopes taking precedence.
+
+Settings can be modified by direct assignment before or after calling :func:`warp.init`,
+though some settings only take effect if set prior to initialization. See individual
+setting documentation for details.
+
+For information on module-level and kernel-level settings, see :doc:`/user_guide/configuration`.
+"""
+
+import os as _os
+import sys as _sys
+import types as _types
+from enum import IntEnum as _IntEnum
+
+from warp._src.logger import LOG_INFO as _LOG_INFO
+
+
+class _ConfigModule(_types.ModuleType):
+    def __setattr__(self, name, value):
+        if name == "launch_array_access_mode" and not isinstance(value, LaunchArrayAccessMode):
+            raise ValueError(
+                f"warp.config.launch_array_access_mode must be a warp.config.LaunchArrayAccessMode value, got {value!r}"
+            )
+        if name == "deterministic" and not isinstance(value, DeterministicMode):
+            raise ValueError(f"warp.config.deterministic must be a warp.DeterministicMode value, got {value!r}")
+        super().__setattr__(name, value)
+
+
+def _install_config_module_hooks() -> None:
+    _sys.modules[__name__].__class__ = _ConfigModule
+
+
+class LaunchArrayAccessMode(_IntEnum):
+    """Array-access verification modes for kernel launches."""
+
+    RELAXED = 0
+    """Perform no launch array access checks before launching kernels."""
+
+    CHECKED = 1
+    """Detect cross-device Warp array access issues before launching kernels where possible."""
+
+    STRICT = 2
+    """Require every Warp array argument to be allocated on the launch device."""
+
+
+class DeterministicMode(_IntEnum):
+    """Deterministic execution modes for supported atomic operations."""
+
+    NOT_GUARANTEED = 0
+    """Use normal atomic execution without constraining atomic ordering."""
+
+    RUN_TO_RUN = 1
+    """Produce bit-exact repeated results on the same GPU architecture."""
+
+    GPU_TO_GPU = 2
+    """Use a stronger path intended to preserve results across GPU architectures."""
+
+
+launch_array_access_mode: LaunchArrayAccessMode = LaunchArrayAccessMode.RELAXED
+"""Kernel launch array access verification mode.
+
+``LaunchArrayAccessMode.RELAXED`` performs no launch array access checks and is
+the default. ``LaunchArrayAccessMode.STRICT`` requires every Warp array argument
+to be allocated on the launch device, matching Warp's original behavior.
+``LaunchArrayAccessMode.CHECKED`` raises an error before launch when Warp can
+determine that a cross-device Warp array argument is not accessible from the
+launch device. When Warp cannot verify access because an array uses an unknown
+custom allocator or externally wrapped allocation, checked mode emits a warning
+once for the launch pattern and allows the launch to proceed.
+
+Unlike ``verify_cuda``, this setting can be used during CUDA graph capture
+because checks run before each launch is recorded. For cross-GPU graph capture,
+enable peer or memory-pool access with Warp APIs before capture begins.
+
+Note: Strict and checked modes impact performance.
+"""
+
+
+version: str = "1.19.0"
+"""Warp version string"""
+
+hip_port: bool = True
+"""This package is the HIP (AMD GPU) port of Warp. Its default kernel cache is kept apart from upstream Warp's
+(``<version>-hip``) so the two never share compiled modules."""
+
+cpu_threads: int = int(_os.environ.get("WARP_CPU_THREADS", "1"))
+"""Threads a CPU kernel launch is split over (this HIP port's addition, ``native/cpu_parallel.cpp``).
+
+``1`` (the default, or the environment variable ``WARP_CPU_THREADS``) runs every CPU launch serially on the calling
+thread, as upstream Warp does. ``0`` uses as many threads as the process's CPU affinity allows (a process pinned to N cores
+gets N). Only one-lane kernels with no tiles and no native snippets are split; others stay serial. CPU atomics are real
+atomics, so results stay correct, but float accumulation order then varies from run to run.
+Can be changed at any time.
+"""
+
+cpu_parallel_min_dim: int = int(_os.environ.get("WARP_CPU_PARALLEL_MIN_DIM", "64"))
+"""A CPU launch smaller than this runs serially even when ``cpu_threads`` is not 1."""
+
+cpu_parallel_auto_dim: int = int(_os.environ.get("WARP_CPU_PARALLEL_AUTO_DIM", "65536"))
+"""A CPU launch at least this large is always split; a smaller one only when its kernel's measured serial cost (its first
+three launches run serially, timed) times the launch size reaches ``cpu_parallel_min_work_us``."""
+
+cpu_parallel_min_work_us: float = float(_os.environ.get("WARP_CPU_PARALLEL_MIN_WORK_US", "20"))
+"""The estimated serial time, in microseconds, below which a launch smaller than ``cpu_parallel_auto_dim`` stays serial."""
+
+cpu_parallel_min_chunk: int = int(_os.environ.get("WARP_CPU_PARALLEL_MIN_CHUNK", "8"))
+"""The fewest launch indices a thread takes at a time in a parallel CPU launch."""
+
+cpu_parallel_spin_us: float = float(_os.environ.get("WARP_CPU_PARALLEL_SPIN_US", "5000"))
+"""How long an idle worker of the CPU launch pool waits for the next launch before it sleeps, in microseconds.
+
+On AMD processors with MONITORX/MWAITX (Zen) the worker waits in the core, at almost no power, woken by the next launch;
+elsewhere it spins with PAUSE, and the wait is capped at 50 us."""
+
+hip_conditional_emulation: bool = _os.environ.get("WARP_HIP_CONDITIONAL_EMULATION", "1") not in ("0", "false", "no")
+"""Emulate conditional graph nodes on HIP (this port's ``warp/_src/hip_conditional.py``).
+
+HIP has no conditional graph nodes. With this on, :func:`~warp.capture_while` and :func:`~warp.capture_if` inside a HIP
+graph capture cut the capture into segments, and :func:`~warp.capture_launch` runs the segments with the loops and
+branches decided on the host (one condition read-back per loop pass). With it off, they raise as upstream Warp does.
+"""
+
+hip_capture_persistent_arrays: bool = _os.environ.get("WARP_HIP_CAPTURE_PERSISTENT_ARRAYS", "1") not in ("0", "false", "no")
+"""Make an array allocated during a HIP graph capture once, outside the capture, and keep it for the graph.
+
+HIP's graph allocations (memory nodes) are not reliably usable from another graph or from API calls, and an emulated
+conditional cuts a capture into several graphs. With this on (the default), the capture is paused around the allocation
+and resumed into the same graph; the memory is freed when the array and every graph captured with it are gone.
+"""
+
+hip_conditional_check_every: int = int(_os.environ.get("WARP_HIP_CONDITIONAL_CHECK_EVERY", "1"))
+"""Passes of an emulated loop body between two reads of its condition (1: exact ``capture_while`` semantics).
+
+A value ``k`` above 1 runs the body ``k`` times per read, so up to ``k - 1`` passes after the condition became 0: only for
+a body that changes nothing once its condition is 0 (MuJoCo Warp's solver iteration), to save host round trips.
+"""
+
+verify_fp: bool = False
+"""Enable floating-point verification for inputs and outputs.
+
+When enabled, checks if all values are finite before and after operations.
+
+Note: Enabling this flag impacts performance.
+"""
+
+verify_cuda: bool = False
+"""Enable CUDA error checking after kernel launches.
+
+This setting cannot be used during graph capture
+
+Note: Enabling this flag impacts performance
+"""
+
+print_launches: bool = False
+"""Enable detailed kernel launch logging.
+
+Prints information about each kernel launch including:
+
+- Launch dimensions
+- Input/output parameters
+- Target device
+
+Note: Enabling this flag impacts performance.
+"""
+
+mode: str = "release"
+"""Compilation mode for Warp kernels.
+
+Args:
+    mode: Either ``"release"`` or ``"debug"``.
+
+Note: Debug mode may impact performance.
+
+This setting can be overridden at the module level by setting the ``"mode"`` module option.
+"""
+
+optimization_level: int | None = None
+"""Optimization level for Warp kernels.
+
+Args:
+    optimization_level: An integer representing the optimization level (0-3), or ``None`` for
+        target-specific defaults (``-O2`` for CPU, ``-O3`` for CUDA).
+
+Note: Higher optimization levels increase compilation time but may improve run-time performance.
+
+This setting can be overridden at the module level by setting the ``"optimization_level"`` module option.
+"""
+
+verbose_warnings: bool = False
+"""Enable extended warning messages with source location information."""
+
+log_level: int = _LOG_INFO
+"""Log level threshold for Warp's logging infrastructure.
+
+Messages below this level are suppressed. Use the ``LOG_DEBUG``, ``LOG_INFO``,
+``LOG_WARNING``, and ``LOG_ERROR`` constants from the ``warp`` module.
+
+Default is ``warp.LOG_INFO`` (20).
+"""
+
+verify_autograd_array_access: bool = False
+"""Enable warnings for array overwrites that may affect gradient computation."""
+
+enable_vector_component_overwrites: bool = False
+"""Allow multiple writes to vector/matrix/quaternion components.
+
+Note: Enabling this may significantly increase kernel compilation time.
+"""
+
+legacy_scalar_return_types: bool = False
+"""Use legacy scalar return types from built-in functions and indexing.
+
+When ``False`` (the default), built-in function calls and vector/matrix
+indexing return Warp scalar instances (e.g. ``wp.float64``, ``wp.int16``)
+that match the input types. The types ``wp.int32``, ``wp.float32``, and
+``wp.bool`` are aliases for Python's ``int``, ``float``, and ``bool``, so
+those continue to return Python built-in values.
+
+Set to ``True`` to restore the pre-1.12 behavior where all scalar
+operations return Python built-in types (``int``, ``float``, ``bool``).
+"""
+
+cache_kernels: bool = True
+"""Enable kernel caching between application launches."""
+
+kernel_cache_dir: str | None = None
+"""Directory path for storing compiled kernel cache.
+
+If ``None``, the path is determined in the following order:
+
+1. ``WARP_CACHE_PATH`` environment variable.
+2. System's user cache directory (via ``appdirs.user_cache_directory``).
+
+A version-specific subdirectory is automatically appended to the resolved
+base path to prevent cache collisions between different Warp versions.
+
+Note: Subdirectories prefixed with ``wp_`` will be created in this location.
+"""
+
+cuda_output: str | None = None
+"""Preferred CUDA output format for kernel compilation.
+
+Args:
+    cuda_output: One of {``None``, ``"ptx"``, ``"cubin"``}. If ``None``, format is auto-determined.
+"""
+
+ptx_target_arch: int | None = None
+"""Target architecture version for PTX generation, e.g., ``ptx_target_arch = 75``.
+
+If ``None``, the architecture is determined by devices present in the system.
+"""
+
+cuda_arch_suffix: str | None = None
+"""CUDA architecture suffix for kernel compilation.
+
+Controls whether architecture-specific or family-specific suffixes are
+appended to the ``--gpu-architecture`` flag passed to NVRTC.
+
+Args:
+    cuda_arch_suffix: One of {``None``, ``"a"``, ``"f"``}.
+        ``None`` disables suffixes (default, current behavior).
+        ``"a"`` enables architecture-specific features (requires sm_90+).
+        ``"f"`` enables family-specific features (requires sm_100+ and CUDA 12.9+).
+"""
+
+lineinfo: bool = False
+"""Enable the compilation of modules with line information.
+
+Modules compiled for GPU execution will be compiled with the
+``--generate-line-info`` compiler option, which generates line-number
+information for device code. Line-number information is always included when
+compiling a module in ``"debug"`` mode regardless of this setting.
+
+This setting can be overridden at the module level by setting the ``"lineinfo"`` module option.
+"""
+
+line_directives: bool = True
+"""Enable Python source line mapping in generated code.
+
+If ``True``, ``#line`` directives are inserted in generated code for modules
+compiled with line information to map back to the original Python source file.
+"""
+
+compile_time_trace: bool = False
+"""Enable the generation of Trace Event Format files for runtime module compilation.
+
+These are JSON files that can be opened by tools like ``edge://tracing/`` and
+``chrome://tracing/``.
+
+This setting is currently only effective when compiling modules for the GPU with NVRTC (CUDA 12.8+).
+
+This setting can be overridden at the module level by setting the ``"compile_time_trace"`` module option.
+"""
+
+enable_backward: bool = True
+"""Enable compilation of kernel backward passes.
+
+This setting can be overridden at the module level by setting the ``"enable_backward"`` module option.
+"""
+
+enable_cpu_blocks: bool = False
+"""Enable experimental CPU kernel launches with more than one logical thread per block.
+
+When ``False``, CPU launch block dimensions greater than one resolve to one,
+preserving the historical CPU execution model. When ``True``, explicit CPU
+block dimensions from 2 through 1024 run with cooperative fibers.
+"""
+
+default_grid_stride: bool = True
+"""Default ``grid_stride`` for kernels that make no explicit choice.
+
+``False`` opts kernels into the lean launch path (no grid-stride loop, lower per-thread overhead and
+register pressure, but ``max_blocks`` cannot be capped). Lowest precedence: a per-kernel
+``@wp.kernel(grid_stride=...)`` argument or the module ``"default_grid_stride"`` option overrides it.
+"""
+
+enable_mathdx_gemm: bool = True
+"""Use libmathdx (cuBLASDx) for tile_matmul on GPU when available.
+
+When False, tile_matmul falls back to a scalar GEMM implementation, which avoids
+the slow libmathdx LTO compilation at the cost of runtime performance.
+
+This setting can be overridden at the module level by setting the
+``"enable_mathdx_gemm"`` module option.
+"""
+
+enable_mathdx_solver: bool = True
+"""Use libmathdx (cuSolverDx) for tile solver ops on GPU when available.
+
+Controls all cuSolverDx-backed ops: :func:`tile_cholesky <warp._src.lang.tile_cholesky>`
+(and its adjoint), :func:`tile_cholesky_solve <warp._src.lang.tile_cholesky_solve>`,
+:func:`tile_lower_solve <warp._src.lang.tile_lower_solve>`, and
+:func:`tile_upper_solve <warp._src.lang.tile_upper_solve>`.
+
+When False, these ops fall back to cooperative shared-memory implementations
+that do not require libmathdx, at the cost of runtime performance.
+
+This setting can be overridden at the module level by setting the
+``"enable_mathdx_solver"`` module option.
+"""
+
+enable_mathdx_fft: bool = True
+"""Use libmathdx (cuFFTDx) for :func:`tile_fft <warp._src.lang.tile_fft>` and
+:func:`tile_ifft <warp._src.lang.tile_ifft>` on GPU when available.
+
+When False, these ops use a fallback that supports power-of-two FFT sizes only,
+trading runtime performance for faster kernel compile times.
+
+This setting can be overridden at the module level by setting the
+``"enable_mathdx_fft"`` module option.
+"""
+
+cpu_compiler_flags: str | None = (
+    "-march=native -mllvm=-inline-threshold=9000 -mllvm=-inline-cold-callsite-threshold=3000"
+    " -mllvm=-slp-recursion-max-depth=4"
+)
+"""Flags controlling CPU kernel compilation.
+
+The default detects host CPU features, raises LLVM's inlining thresholds,
+and limits SLP recursion depth to four instead of LLVM's default 12. Set this
+to ``None`` to retain host feature detection with LLVM's default inlining
+thresholds and SLP recursion depth.
+``""`` compiles for a generic CPU target. A flag string can include
+``-march=native``, Clang frontend flags, and LLVM arguments in either
+``-mllvm <option>`` or ``-mllvm=<option>`` form. Use ``-fno-vectorize`` to
+disable loop vectorization or ``-fno-slp-vectorize`` to disable SLP
+vectorization for a module.
+
+The ``"cpu_compiler_flags"`` module option replaces this global string for
+that module. Use ``"-march=native"`` to keep host feature detection while
+using LLVM's default inlining thresholds and SLP recursion depth. ``None`` at
+the module level inherits the global setting.
+
+The resolved flag string is part of the module cache key.
+LLVM options are a power-user feature with process-wide caveats; see
+:ref:`cpu-llvm-compiler-options`.
+"""
+
+llvm_cuda: bool = False
+"""Use Clang/LLVM compiler instead of NVRTC for CUDA compilation."""
+
+enable_graph_capture_module_load_by_default: bool = True
+"""Enable automatic module loading before graph capture.
+
+Only affects systems with CUDA driver versions below 12.3.
+"""
+
+enable_mempools_at_init: bool = _os.environ.get("WARP_ENABLE_MEMPOOLS_AT_INIT", "1").lower() not in ("0", "false", "no")
+"""Enable CUDA memory pools during device initialization when supported.
+
+Set ``WARP_ENABLE_MEMPOOLS_AT_INIT`` to ``0``, ``false``, or ``no`` before
+importing Warp to disable automatic memory pool initialization (e.g. when
+sharing the process with a framework that owns its own GPU allocator).
+"""
+
+track_memory: bool = False
+"""Enable tracking of memory allocations at initialization.
+
+When ``True`` at the time :func:`warp.init` is called, a
+:class:`~warp.ScopedMemoryTracker` is automatically activated for all
+devices. For on-demand tracking, use :class:`~warp.ScopedMemoryTracker`
+directly as a context manager.
+
+Note: Impacts performance when active due to call-stack introspection.
+"""
+
+max_unroll: int = 16
+"""Maximum unroll factor for loops.
+
+Note that ``max_unroll`` does not consider the total number of iterations in
+nested loops. This can result in a large amount of automatically generated code
+if each nested loop is below the ``max_unroll`` threshold.
+
+This setting can be overridden at the module level by setting the ``"max_unroll"`` module option.
+"""
+
+enable_tiles_in_stack_memory: bool | None = True
+"""Use stack memory instead of static memory for tile allocations on the CPU.
+
+Static memory in kernels is not well supported on some architectures (notably AArch64). We work
+around it by reserving stack memory on kernel entry and pointing a reserved callee-saved
+register to it (AArch64) or a single static pointer (x86-64).
+
+When set to ``None``, this flag automatically enables stack memory on ``aarch64``
+platforms (Linux ARM) and disables it on other architectures. To explicitly enable or disable
+this behavior regardless of architecture, set this flag to ``True`` or ``False``.
+"""
+
+use_precompiled_headers: bool = True
+"""Enable the use of precompiled headers during kernel compilation.
+"""
+
+legacy_cpu_linker: bool = False
+"""Use the legacy RTDyld linker instead of JITLink for CPU kernel loading.
+
+The default JITLink linker is more robust against virtual address space
+fragmentation (e.g. caused by the CUDA driver). Set this to ``True`` to
+use the older RTDyld linker, which supports step-through debugging of CPU
+kernels with pre-built LLVM libraries that lack the JITLink debug symbols.
+
+This setting can be changed at runtime.  Each linker has its own JIT
+instance, created lazily on first use and kept alive so that previously
+loaded CPU modules remain valid.
+
+.. note::
+
+   Step-through debugging with JITLink requires building Warp with
+   ``--build-llvm`` to get LLVM 21+ with the necessary ORC runtime symbols.
+
+.. warning::
+
+   This flag is experimental and may be removed without warning in a
+   future release.
+"""
+
+load_module_max_workers: int | None = 0
+"""Default number of worker threads for compiling and loading modules in parallel.
+
+For ``wp.load_module()`` and ``wp.force_load()``, if the ``max_workers`` parameter is not specified,
+the default number of worker threads is determined by this setting. ``0`` means serial loading.
+If ``None``, Warp determines the behavior (currently equal to ``min(os.cpu_count(), 4)``).
+"""
+
+deterministic: DeterministicMode = DeterministicMode.NOT_GUARANTEED
+"""Determinism guarantee for supported atomic operations.
+
+Accepted values are:
+
+- ``wp.DeterministicMode.NOT_GUARANTEED``: Default behavior.
+- ``wp.DeterministicMode.RUN_TO_RUN``: Bit-exact repeated results on the same GPU
+  architecture.
+- ``wp.DeterministicMode.GPU_TO_GPU``: Stronger cross-GPU reproducibility path.
+
+Set this before module creation/import for it to apply broadly. Existing
+modules can be changed by setting the ``"deterministic"`` module option.
+See :doc:`/user_guide/execution_and_performance/deterministic_execution` for supported patterns,
+performance considerations, and limitations.
+"""
+
+deterministic_max_records: int = 0
+"""Default per-target, per-thread record bound for deterministic atomics.
+
+The default ``0`` uses the code-generated lower bound. Increase this before
+module creation/import when kernels have data-dependent loops or repeated visits
+to the same atomic site that static analysis cannot bound.
+
+Modules can override this by setting the ``"deterministic_max_records"`` module
+option.
+"""
+
+deterministic_debug: bool = False
+"""Enable debug diagnostics for deterministic execution mode.
+
+When enabled, deterministic buffer overflows and slot-assignment mismatches may
+emit device-side diagnostics, including during CUDA graph replay.
+This setting is intended for debugging capacity issues and should remain disabled
+for normal execution, especially when CUDA graph capture is performance-critical.
+"""
+
+_git_commit_hash: str | None = None
+"""Git commit hash associated with the Warp installation.
+
+Set automatically by CI, do not modify.
+"""
+
+
+_install_config_module_hooks()

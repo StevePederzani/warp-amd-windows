@@ -1,0 +1,616 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import inspect
+import io
+import sys
+import unittest
+import warnings
+
+import numpy as np
+
+import warp as wp
+import warp.geometry
+from warp._src import logger as _logger_module
+from warp.tests.unittest_utils import *
+
+
+@wp.kernel
+def make_field_sphere_sdf(field: wp.array3d[float], center: wp.vec3, radius: float):
+    """Make a sphere SDF for nodes on the integer domain with node coordinates 0,1,2,3,..."""
+
+    i, j, k = wp.tid()
+
+    p = wp.vec3(float(i), float(j), float(k))
+
+    d = wp.length(p - center) - radius
+
+    field[i, j, k] = d
+
+
+@wp.kernel
+def make_field_sphere_sdf_unit_domain(field: wp.array3d[float], center: wp.vec3, radius: wp.array[wp.float32]):
+    """Create a sphere SDF for nodes on the unit domain ``[-1, 1]^3``."""
+    i, j, k = wp.tid()
+
+    nx, ny, nz = field.shape[0], field.shape[1], field.shape[2]
+
+    p = wp.vec3(
+        2.0 * wp.float32(i) / (wp.float32(nx) - 1.0) - 1.0,
+        2.0 * wp.float32(j) / (wp.float32(ny) - 1.0) - 1.0,
+        2.0 * wp.float32(k) / (wp.float32(nz) - 1.0) - 1.0,
+    )
+
+    d = wp.length(p - center) - radius[0]
+
+    field[i, j, k] = d
+
+
+@wp.kernel
+def compute_surface_area(verts: wp.array[wp.vec3], faces: wp.array[wp.int32], out_area: wp.array[wp.float32]):
+    tid = wp.tid()
+    vi = faces[3 * tid + 0]
+    vj = faces[3 * tid + 1]
+    vk = faces[3 * tid + 2]
+
+    p0 = verts[vi]
+    p1 = verts[vj]
+    p2 = verts[vk]
+
+    # Heron's formula for triangle area
+    a = wp.length(p1 - p0)
+    b = wp.length(p2 - p0)
+    c = wp.length(p2 - p1)
+    s = (a + b + c) / 2.0
+    area = wp.sqrt(s * (s - a) * (s - b) * (s - c))
+
+    wp.atomic_add(out_area, 0, area)
+
+
+def validate_marching_cubes_output(test, verts_np, faces_np, check_nonempty=True):
+    # check that the face array seems valid
+    if check_nonempty:
+        test.assertGreater(faces_np.shape[0], 0)  # at least one face
+    test.assertEqual(faces_np.shape[1], 3)  # all faces triangular
+    test.assertTrue((faces_np >= 0).all())  # all face inds nonnegative
+    test.assertTrue((faces_np < verts_np.shape[0]).all())  # all face inds are in-bounds on the vertex array
+    test.assertTrue((faces_np[:, 0] != faces_np[:, 1]).all())  # all faces have unique vertices
+    test.assertTrue((faces_np[:, 0] != faces_np[:, 2]).all())  # all faces have unique vertices
+    test.assertTrue((faces_np[:, 1] != faces_np[:, 2]).all())  # all faces have unique vertices
+    test.assertTrue(
+        (np.unique(faces_np.flatten()) == np.arange(verts_np.shape[0])).all()
+    )  # all vertices are used in at least one face
+
+    # check that the vertex array seems valid
+    if check_nonempty:
+        test.assertGreater(verts_np.shape[0], 0)  # at least one vertex
+    test.assertEqual(verts_np.shape[1], 3)  # all vertices are 3D
+    test.assertTrue(np.isfinite(verts_np).all())  # all vertices are finite
+
+
+def test_marching_cubes(test, device):
+    """Test typical usage of the stateful interface."""
+    node_dim = 64
+    cell_dim = node_dim - 1
+    field = wp.zeros(shape=(node_dim, node_dim, node_dim), dtype=float, device=device)
+    bounds_low = (0.0, 0.0, 0.0)
+    bounds_high = (float(cell_dim), float(cell_dim), float(cell_dim))
+
+    iso = wp.geometry.IsoSurfaceMarchingCubes(
+        nx=node_dim,
+        ny=node_dim,
+        nz=node_dim,
+        lower=bounds_low,
+        upper=bounds_high,
+    )
+
+    radius = node_dim / 4.0
+
+    wp.launch(
+        make_field_sphere_sdf,
+        dim=field.shape,
+        inputs=[field, wp.vec3(node_dim / 2, node_dim / 2, node_dim / 2), radius],
+        device=device,
+    )
+
+    iso.surface(field=field, threshold=0.0)
+    verts_np = iso.verts.numpy()
+    faces_np = iso.indices.numpy().reshape(-1, 3)
+    test.assertEqual(
+        iso.indices.dtype, wp.int32
+    )  # make sure we are following Warp convention of using a flat array of indices
+    validate_marching_cubes_output(test, verts_np, faces_np)
+
+    # check that all returned vertices lie on the surface of the sphere
+    length = np.linalg.norm(verts_np - np.array([node_dim / 2, node_dim / 2, node_dim / 2]), axis=1)
+    error = np.abs(length - radius)
+    test.assertTrue(np.max(error) < 1.0)
+
+    iso.resize(nx=node_dim * 2, ny=node_dim * 2, nz=node_dim * 2)  # smoke test reuse with new dimensions
+
+
+def test_marching_cubes_functional(test, device):
+    """Ensure the single-function interface works as expected."""
+    node_dim = 64
+    cell_dim = node_dim - 1
+    field = wp.zeros(shape=(node_dim, node_dim, node_dim), dtype=float, device=device)
+    bounds_low = (0.0, 0.0, 0.0)
+    bounds_high = (float(cell_dim), float(cell_dim), float(cell_dim))
+
+    radius = node_dim / 4.0
+    wp.launch(
+        make_field_sphere_sdf,
+        dim=field.shape,
+        inputs=[field, wp.vec3(node_dim / 2, node_dim / 2, node_dim / 2), radius],
+        device=device,
+    )
+
+    # call via the functional interface
+    verts, faces = wp.geometry.IsoSurfaceMarchingCubes.extract(
+        field, threshold=0.0, lower=bounds_low, upper=bounds_high
+    )
+
+    verts_np = verts.numpy()
+    faces_np = faces.numpy().reshape(-1, 3)
+    validate_marching_cubes_output(test, verts_np, faces_np)
+
+    # check that all returned vertices lie on the surface of the sphere
+    length = np.linalg.norm(verts_np - np.array([node_dim / 2, node_dim / 2, node_dim / 2]), axis=1)
+    error = np.abs(length - radius)
+    test.assertTrue(np.max(error) < 1.0)
+
+
+def test_marching_cubes_nonuniform(test, device):
+    """Test the logic for when the dimensions of the grid are not uniform."""
+
+    dimX = 64
+    dimY = 48
+    dimZ = 72
+    field = wp.zeros(shape=(dimX, dimY, dimZ), dtype=float, device=device)
+
+    bounds_low = wp.vec3(0.0, 0.0, 0.0)
+    bounds_high = wp.vec3(float(dimX), float(dimY), float(dimZ))
+
+    iso = wp.geometry.IsoSurfaceMarchingCubes(
+        nx=dimX,
+        ny=dimY,
+        nz=dimZ,
+        lower=bounds_low,
+        upper=bounds_high,
+    )
+
+    radius = dimX / 4.0
+    wp.launch(
+        make_field_sphere_sdf,
+        dim=field.shape,
+        inputs=[field, wp.vec3(dimX / 2, dimY / 2, dimZ / 2), radius],
+        device=device,
+    )
+
+    iso.surface(field=field, threshold=0.0)
+    verts_np = iso.verts.numpy()
+    faces_np = iso.indices.numpy().reshape(-1, 3)
+    validate_marching_cubes_output(test, verts_np, faces_np)
+
+
+def test_marching_cubes_empty_output(test, device):
+    """Make sure we handle the empty-output case correctly."""
+
+    dim = 64
+    field = wp.zeros(shape=(dim, dim, dim), dtype=float, device=device)
+
+    iso = wp.geometry.IsoSurfaceMarchingCubes(nx=dim, ny=dim, nz=dim)
+
+    wp.launch(make_field_sphere_sdf, dim=field.shape, inputs=[field, wp.vec3(0.5, 0.5, 0.5), 0.25], device=device)
+
+    iso.surface(field=field, threshold=1000.0)  # set threshold to a large value so that no vertices are generated
+    verts_np = iso.verts.numpy()
+    faces_np = iso.indices.numpy().reshape(-1, 3)
+    validate_marching_cubes_output(test, verts_np, faces_np, check_nonempty=False)
+
+    test.assertEqual(faces_np.shape[0], 0)  # no faces
+    test.assertEqual(verts_np.shape[0], 0)  # no vertices
+
+
+def test_marching_cubes_degenerate_field(test, device):
+    """Check that fields too thin to span a cell are rejected up front."""
+
+    # A grid needs two nodes on an axis to span one cell, so a single-node axis
+    # has nothing to extract from. Without validation these reach the extraction
+    # kernels and fail on a zero-length scan buffer instead.
+    for shape in ((1, 8, 8), (8, 1, 8), (8, 8, 1), (1, 1, 1), (0, 8, 8)):
+        field = wp.zeros(shape=shape, dtype=wp.float32, device=device)
+        with test.assertRaisesRegex(ValueError, "at least 2 nodes on each axis"):
+            wp.geometry.IsoSurfaceMarchingCubes.extract(field, threshold=0.0)
+
+        # the stateful interface routes through the same validation
+        iso = wp.geometry.IsoSurfaceMarchingCubes(nx=shape[0], ny=shape[1], nz=shape[2])
+        with test.assertRaisesRegex(ValueError, "at least 2 nodes on each axis"):
+            iso.surface(field=field, threshold=0.0)
+
+    # two nodes on every axis is the smallest field that does extract
+    field = wp.zeros(shape=(2, 2, 2), dtype=wp.float32, device=device)
+    wp.geometry.IsoSurfaceMarchingCubes.extract(field, threshold=0.0)
+
+
+def test_marching_cubes_differentiable(test, device):
+    """Check that marching cubes has reasonable gradients.
+
+    This test constructs an SDF of sphere, extracts a surface, computes its
+    surface area, and then differentiates the surface area with respect to
+    the sphere's radius.
+    """
+    node_dim = 64
+    bounds_low = wp.vec3(-1.0, -1.0, -1.0)
+    bounds_high = wp.vec3(1.0, 1.0, 1.0)
+
+    radius = 0.5
+    radius_wp = wp.full((1,), value=0.5, dtype=wp.float32, device=device, requires_grad=True)
+
+    with wp.Tape() as tape:
+        field = wp.zeros(shape=(node_dim, node_dim, node_dim), dtype=float, device=device, requires_grad=True)
+        wp.launch(
+            make_field_sphere_sdf_unit_domain,
+            dim=field.shape,
+            inputs=[field, wp.vec3(0.0, 0.0, 0.0), radius_wp],
+            device=device,
+        )
+
+        # call via the functional interface
+        verts, faces = wp.geometry.IsoSurfaceMarchingCubes.extract(
+            field, threshold=0.0, lower=bounds_low, upper=bounds_high
+        )
+
+        # compute surface area
+        area = wp.zeros(shape=(1,), dtype=float, device=device, requires_grad=True)
+        wp.launch(compute_surface_area, dim=faces.shape[0] // 3, inputs=[verts, faces, area], device=device)
+
+        # confirm surface area is correct vs. the analytical ground truth
+        area_np = area.numpy()[0]
+        test.assertTrue(np.abs(area_np - 4.0 * np.pi * radius * radius) < 1e-2)
+
+    # compute the gradient of the surface area with respect to the radius
+    tape.backward(area)
+
+    # confirm the gradient is correct vs. the analytical ground truth
+    grad_np = radius_wp.grad.numpy()[0]
+    test.assertTrue(np.abs(grad_np - 8.0 * np.pi * radius) < 1e-2)
+
+
+def test_mc_lookup_tables_structure(test, device):
+    """Test that lookup tables have correct sizes and types."""
+    # Access via class attributes
+    CUBE_CORNER_OFFSETS = wp.geometry.IsoSurfaceMarchingCubes.CUBE_CORNER_OFFSETS
+    EDGE_TO_CORNERS = wp.geometry.IsoSurfaceMarchingCubes.EDGE_TO_CORNERS
+    CASE_TO_TRI_RANGE = wp.geometry.IsoSurfaceMarchingCubes.CASE_TO_TRI_RANGE
+    TRI_LOCAL_INDICES = wp.geometry.IsoSurfaceMarchingCubes.TRI_LOCAL_INDICES
+
+    # Verify types are tuples (immutable)
+    test.assertIsInstance(CUBE_CORNER_OFFSETS, tuple)
+    test.assertIsInstance(EDGE_TO_CORNERS, tuple)
+    test.assertIsInstance(CASE_TO_TRI_RANGE, tuple)
+    test.assertIsInstance(TRI_LOCAL_INDICES, tuple)
+
+    # Verify sizes
+    test.assertEqual(len(CUBE_CORNER_OFFSETS), 8)  # 8 corners of a cube
+    test.assertEqual(len(EDGE_TO_CORNERS), 12)  # 12 edges of a cube
+    test.assertEqual(len(CASE_TO_TRI_RANGE), 257)  # 256 cases + 1 for range end
+    test.assertEqual(len(TRI_LOCAL_INDICES), 2460)  # 820 triangles x 3 vertices each
+
+    # Verify nested structure
+    for corner in CUBE_CORNER_OFFSETS:
+        test.assertIsInstance(corner, tuple)
+        test.assertEqual(len(corner), 3)  # (x, y, z)
+
+    for edge in EDGE_TO_CORNERS:
+        test.assertIsInstance(edge, tuple)
+        test.assertEqual(len(edge), 2)  # (corner_from, corner_to)
+
+
+def test_mc_lookup_tables_values(test, device):
+    """Test that lookup table values are valid."""
+    # Access via class attributes
+    CUBE_CORNER_OFFSETS = wp.geometry.IsoSurfaceMarchingCubes.CUBE_CORNER_OFFSETS
+    EDGE_TO_CORNERS = wp.geometry.IsoSurfaceMarchingCubes.EDGE_TO_CORNERS
+    CASE_TO_TRI_RANGE = wp.geometry.IsoSurfaceMarchingCubes.CASE_TO_TRI_RANGE
+    TRI_LOCAL_INDICES = wp.geometry.IsoSurfaceMarchingCubes.TRI_LOCAL_INDICES
+
+    # Corner offsets should be 0 or 1
+    for corner in CUBE_CORNER_OFFSETS:
+        for coord in corner:
+            test.assertIn(coord, (0, 1))
+
+    # Edge corners should reference valid corner indices (0-7)
+    for edge in EDGE_TO_CORNERS:
+        for corner_idx in edge:
+            test.assertGreaterEqual(corner_idx, 0)
+            test.assertLessEqual(corner_idx, 7)
+
+    # Case to tri range should be monotonically non-decreasing
+    for i in range(len(CASE_TO_TRI_RANGE) - 1):
+        test.assertLessEqual(CASE_TO_TRI_RANGE[i], CASE_TO_TRI_RANGE[i + 1])
+
+    # First case (all corners outside) should have no triangles
+    test.assertEqual(CASE_TO_TRI_RANGE[0], CASE_TO_TRI_RANGE[1])
+
+    # Last case (all corners inside) should have no triangles
+    test.assertEqual(CASE_TO_TRI_RANGE[255], CASE_TO_TRI_RANGE[256])
+
+    # Triangle local indices should reference valid edge indices (0-11)
+    for edge_idx in TRI_LOCAL_INDICES:
+        test.assertGreaterEqual(edge_idx, 0)
+        test.assertLessEqual(edge_idx, 11)
+
+
+def test_mc_lookup_tables_to_warp_array(test, device):
+    """Test that lookup tables can be converted to Warp arrays."""
+    # Access via class attributes
+    CUBE_CORNER_OFFSETS = wp.geometry.IsoSurfaceMarchingCubes.CUBE_CORNER_OFFSETS
+    EDGE_TO_CORNERS = wp.geometry.IsoSurfaceMarchingCubes.EDGE_TO_CORNERS
+    CASE_TO_TRI_RANGE = wp.geometry.IsoSurfaceMarchingCubes.CASE_TO_TRI_RANGE
+    TRI_LOCAL_INDICES = wp.geometry.IsoSurfaceMarchingCubes.TRI_LOCAL_INDICES
+
+    # Convert to warp arrays with appropriate dtypes
+    corner_offsets = wp.array(CUBE_CORNER_OFFSETS, dtype=wp.vec3ub, device=device)
+    edge_to_corners = wp.array(EDGE_TO_CORNERS, dtype=wp.vec2ub, device=device)
+    case_to_tri_range = wp.array(CASE_TO_TRI_RANGE, dtype=wp.int32, device=device)
+    tri_local_indices = wp.array(TRI_LOCAL_INDICES, dtype=wp.int32, device=device)
+
+    # Verify shapes
+    test.assertEqual(corner_offsets.shape, (8,))
+    test.assertEqual(edge_to_corners.shape, (12,))
+    test.assertEqual(case_to_tri_range.shape, (257,))
+    test.assertEqual(tri_local_indices.shape, (2460,))
+
+    # Verify we can read values back
+    corner_offsets_np = corner_offsets.numpy()
+    test.assertEqual(tuple(corner_offsets_np[0]), (0, 0, 0))
+    test.assertEqual(tuple(corner_offsets_np[1]), (1, 0, 0))
+
+    edge_to_corners_np = edge_to_corners.numpy()
+    test.assertEqual(tuple(edge_to_corners_np[0]), (0, 1))  # edge 0 connects corners 0 and 1
+
+
+def test_marching_cubes_extract_deprecated_alias(test, device):
+    """Check that the deprecated extract_surface_marching_cubes() alias warns and matches extract()."""
+    node_dim = 32
+    field = wp.zeros(shape=(node_dim, node_dim, node_dim), dtype=float, device=device)
+
+    radius = node_dim / 4.0
+    wp.launch(
+        make_field_sphere_sdf,
+        dim=field.shape,
+        inputs=[field, wp.vec3(node_dim / 2, node_dim / 2, node_dim / 2), radius],
+        device=device,
+    )
+
+    verts, faces = wp.geometry.IsoSurfaceMarchingCubes.extract(field, threshold=0.0)
+
+    # The logger deduplicates DeprecationWarnings globally, so reset its cache
+    # around the call to reliably observe the warning on stderr.
+    saved_warnings_seen = _logger_module._warnings_seen.copy()
+    _logger_module._warnings_seen.clear()
+    old_stderr = sys.stderr
+    sys.stderr = io.StringIO()
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("always", DeprecationWarning)
+            alias_verts, alias_faces = wp.geometry.IsoSurfaceMarchingCubes.extract_surface_marching_cubes(
+                field, threshold=0.0
+            )
+        stderr_output = sys.stderr.getvalue()
+    finally:
+        sys.stderr = old_stderr
+        _logger_module._warnings_seen.clear()
+        _logger_module._warnings_seen.update(saved_warnings_seen)
+
+    test.assertIn("MarchingCubes.extract_surface_marching_cubes() is deprecated", stderr_output)
+
+    np.testing.assert_array_equal(verts.numpy(), alias_verts.numpy())
+    np.testing.assert_array_equal(faces.numpy(), alias_faces.numpy())
+
+
+devices = get_test_devices()
+
+
+class TestMarchingCubes(unittest.TestCase):
+    def test_marching_cubes_deprecated_bound_argument_warning_location(self):
+        """Check that a deprecated bound argument warns at the caller's line."""
+        saved_verbose_warnings = wp.config.verbose_warnings
+        saved_warnings_seen = _logger_module._warnings_seen.copy()
+        _logger_module._warnings_seen.clear()
+        old_stderr = sys.stderr
+        sys.stderr = io.StringIO()
+        try:
+            wp.config.verbose_warnings = True
+            with warnings.catch_warnings():
+                warnings.simplefilter("always", DeprecationWarning)
+                expected_line = inspect.currentframe().f_lineno + 1
+                wp.geometry.IsoSurfaceMarchingCubes(8, 8, 8, domain_bounds_lower_corner=None)
+            stderr_output = sys.stderr.getvalue()
+        finally:
+            sys.stderr = old_stderr
+            wp.config.verbose_warnings = saved_verbose_warnings
+            _logger_module._warnings_seen.clear()
+            _logger_module._warnings_seen.update(saved_warnings_seen)
+
+        self.assertIn(f"{__file__}:{expected_line}", stderr_output)
+
+    def test_marching_cubes_deprecated_bound_arguments(self):
+        """Check that the legacy constructor bound names warn and forward."""
+        lower = (-1.0, -2.0, -3.0)
+        upper = (1.0, 2.0, 3.0)
+
+        saved_warnings_seen = _logger_module._warnings_seen.copy()
+        _logger_module._warnings_seen.clear()
+        old_stderr = sys.stderr
+        sys.stderr = io.StringIO()
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("always", DeprecationWarning)
+                try:
+                    iso = wp.geometry.IsoSurfaceMarchingCubes(
+                        8,
+                        8,
+                        8,
+                        domain_bounds_lower_corner=lower,
+                        domain_bounds_upper_corner=upper,
+                    )
+                except TypeError as error:
+                    self.fail(f"Legacy marching-cubes bound arguments were rejected: {error}")
+            stderr_output = sys.stderr.getvalue()
+        finally:
+            sys.stderr = old_stderr
+            _logger_module._warnings_seen.clear()
+            _logger_module._warnings_seen.update(saved_warnings_seen)
+
+        self.assertEqual(iso.lower, lower)
+        self.assertEqual(iso.upper, upper)
+        self.assertIn("argument `domain_bounds_lower_corner` is deprecated", stderr_output)
+        self.assertIn("Use `lower` instead", stderr_output)
+        self.assertIn("argument `domain_bounds_upper_corner` is deprecated", stderr_output)
+        self.assertIn("Use `upper` instead", stderr_output)
+
+    def test_marching_cubes_deprecated_bound_attributes(self):
+        """Check that the legacy bound attributes warn and forward."""
+        iso = wp.geometry.IsoSurfaceMarchingCubes(8, 8, 8, lower=(0.0, 0.0, 0.0), upper=(7.0, 7.0, 7.0))
+        lower = (-1.0, -2.0, -3.0)
+        upper = (1.0, 2.0, 3.0)
+
+        saved_warnings_seen = _logger_module._warnings_seen.copy()
+        _logger_module._warnings_seen.clear()
+        old_stderr = sys.stderr
+        sys.stderr = io.StringIO()
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("always", DeprecationWarning)
+                iso.domain_bounds_lower_corner = lower
+                iso.domain_bounds_upper_corner = upper
+                legacy_lower = iso.domain_bounds_lower_corner
+                legacy_upper = iso.domain_bounds_upper_corner
+            stderr_output = sys.stderr.getvalue()
+        finally:
+            sys.stderr = old_stderr
+            _logger_module._warnings_seen.clear()
+            _logger_module._warnings_seen.update(saved_warnings_seen)
+
+        self.assertEqual(iso.lower, lower)
+        self.assertEqual(iso.upper, upper)
+        self.assertEqual(legacy_lower, lower)
+        self.assertEqual(legacy_upper, upper)
+        self.assertIn("IsoSurfaceMarchingCubes.domain_bounds_lower_corner is deprecated", stderr_output)
+        self.assertIn("Use `lower` instead", stderr_output)
+        self.assertIn("IsoSurfaceMarchingCubes.domain_bounds_upper_corner is deprecated", stderr_output)
+        self.assertIn("Use `upper` instead", stderr_output)
+
+    def test_marching_cubes_bound_argument_conflicts(self):
+        """Check that callers cannot mix canonical and legacy bound names."""
+        cases = (
+            (
+                {"lower": (-1.0, -1.0, -1.0), "domain_bounds_lower_corner": (-2.0, -2.0, -2.0)},
+                "lower",
+                "domain_bounds_lower_corner",
+            ),
+            (
+                {"upper": (1.0, 1.0, 1.0), "domain_bounds_upper_corner": (2.0, 2.0, 2.0)},
+                "upper",
+                "domain_bounds_upper_corner",
+            ),
+        )
+
+        for arguments, canonical_name, legacy_name in cases:
+            with self.subTest(canonical_name=canonical_name):
+                with self.assertRaisesRegex(
+                    TypeError,
+                    f"Cannot specify both `{canonical_name}` and `{legacy_name}`",
+                ):
+                    wp.geometry.IsoSurfaceMarchingCubes(8, 8, 8, **arguments)
+
+    def test_marching_cubes_iso_surface_base(self):
+        """Check that IsoSurfaceMarchingCubes implements the wp.geometry.IsoSurfaceBase interface."""
+        self.assertTrue(issubclass(wp.geometry.IsoSurfaceMarchingCubes, wp.geometry.IsoSurfaceBase))
+
+        iso = wp.geometry.IsoSurfaceMarchingCubes(8, 8, 8)
+        self.assertIsInstance(iso, wp.geometry.IsoSurfaceBase)
+
+        # The base class is abstract and cannot be instantiated directly.
+        with self.assertRaises(TypeError):
+            wp.geometry.IsoSurfaceBase(8, 8, 8)
+
+    def test_marching_cubes_deprecated_top_level_alias(self):
+        """Check that the deprecated wp.MarchingCubes alias warns but still extracts.
+
+        The alias resolves through ``warp.__getattr__`` to the new class itself,
+        so ``isinstance`` checks agree in both directions and the deprecation
+        warning is emitted on attribute access.
+        """
+        self.assertIs(wp.MarchingCubes, wp.geometry.IsoSurfaceMarchingCubes)
+
+        node_dim = 16
+        field = wp.zeros((node_dim, node_dim, node_dim), dtype=wp.float32)
+        wp.launch(
+            make_field_sphere_sdf,
+            dim=field.shape,
+            inputs=[field, wp.vec3(node_dim / 2, node_dim / 2, node_dim / 2), 4.0],
+        )
+
+        # The logger deduplicates DeprecationWarnings globally, so reset its cache
+        # around the call to reliably observe the warning on stderr.
+        saved_warnings_seen = _logger_module._warnings_seen.copy()
+        _logger_module._warnings_seen.clear()
+        old_stderr = sys.stderr
+        sys.stderr = io.StringIO()
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("always", DeprecationWarning)
+                iso = wp.MarchingCubes(nx=node_dim, ny=node_dim, nz=node_dim)
+            stderr_output = sys.stderr.getvalue()
+        finally:
+            sys.stderr = old_stderr
+            _logger_module._warnings_seen.clear()
+            _logger_module._warnings_seen.update(saved_warnings_seen)
+
+        self.assertIn("wp.MarchingCubes is deprecated", stderr_output)
+        self.assertIn("wp.geometry.IsoSurfaceMarchingCubes", stderr_output)
+
+        self.assertIsInstance(iso, wp.geometry.IsoSurfaceBase)
+
+        # An object built through the new name is also an instance of the alias.
+        # The previous subclass alias could not satisfy this direction.
+        self.assertIsInstance(wp.geometry.IsoSurfaceMarchingCubes(8, 8, 8), wp.MarchingCubes)
+
+        iso.surface(field, threshold=0.0)
+        expected_verts, expected_faces = wp.geometry.IsoSurfaceMarchingCubes.extract(field, threshold=0.0)
+        np.testing.assert_array_equal(iso.verts.numpy(), expected_verts.numpy())
+        np.testing.assert_array_equal(iso.indices.numpy(), expected_faces.numpy())
+
+
+add_function_test(TestMarchingCubes, "test_marching_cubes", test_marching_cubes, devices=devices)
+add_function_test(TestMarchingCubes, "test_marching_cubes_functional", test_marching_cubes_functional, devices=devices)
+add_function_test(TestMarchingCubes, "test_marching_cubes_nonuniform", test_marching_cubes_nonuniform, devices=devices)
+add_function_test(
+    TestMarchingCubes, "test_marching_cubes_empty_output", test_marching_cubes_empty_output, devices=devices
+)
+add_function_test(
+    TestMarchingCubes, "test_marching_cubes_degenerate_field", test_marching_cubes_degenerate_field, devices=devices
+)
+add_function_test(
+    TestMarchingCubes, "test_marching_cubes_differentiable", test_marching_cubes_differentiable, devices=devices
+)
+add_function_test(
+    TestMarchingCubes, "test_mc_lookup_tables_structure", test_mc_lookup_tables_structure, devices=devices
+)
+add_function_test(TestMarchingCubes, "test_mc_lookup_tables_values", test_mc_lookup_tables_values, devices=devices)
+add_function_test(
+    TestMarchingCubes, "test_mc_lookup_tables_to_warp_array", test_mc_lookup_tables_to_warp_array, devices=devices
+)
+add_function_test(
+    TestMarchingCubes,
+    "test_marching_cubes_extract_deprecated_alias",
+    test_marching_cubes_extract_deprecated_alias,
+    devices=devices,
+)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
